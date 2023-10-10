@@ -338,6 +338,23 @@ void exit(int status) {
 
   acquire(&p->lock);
 
+  exit_info("proc %d exit, parent pid %d, name %s, state %s\n",
+            p->pid,
+            original_parent->pid,
+            original_parent->name,
+            procstate_name(original_parent->state));
+  for (int i = 0, child = 0; i < NPROC; i++) {
+    struct proc *curr = &proc[i];
+    if (curr->parent != 0 && curr->parent->pid == p->pid) {
+      exit_info("proc %d exit, child %d, pid %d, name %s, state %s\n",
+                p->pid,
+                child++,
+                curr->pid,
+                curr->name,
+                procstate_name(curr->state));
+    }
+  }
+
   // Give any children to init.
   reparent(p);
 
