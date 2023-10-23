@@ -9,7 +9,9 @@
 #include "riscv.h"
 #include "defs.h"
 
-void freerange(void *pa_start, void *pa_end);
+void freerange(void *pa_start, void *pa_end, uint32 cpuid);
+
+void kfree0(void *pa, uint32 cpuid);
 
 extern char end[]; // first address after kernel.
                    // defined by kernel.ld.
@@ -19,32 +21,37 @@ struct run {
 };
 
 struct {
-  struct spinlock lock;
-  struct run *freelist;
+  struct spinlock locks[CPUS];
+  struct spinlock borrow_mutex;
+  struct run *freelists[CPUS];
 } kmem;
 
 void
 kinit()
 {
-  initlock(&kmem.lock, "kmem");
-  freerange(end, (void*)PHYSTOP);
+  uint64 base = PGROUNDUP((uint64)end);
+  uint64 range = PGROUNDDOWN((PHYSTOP - (uint64)end) / CPUS);
+  for (int i = 0; i < CPUS; i++) {
+    initlock(&kmem.locks[i], "kmem");
+    if (i == CPUS - 1) {
+      freerange((void *)(base + range * i), (void *)PHYSTOP, i);
+    } else {
+      freerange((void *)(base + range * i), (void *)(base + range * (i + 1)), i);
+    }
+  }
 }
 
 void
-freerange(void *pa_start, void *pa_end)
+freerange(void *pa_start, void *pa_end, uint32 cpuid)
 {
   char *p;
   p = (char*)PGROUNDUP((uint64)pa_start);
   for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
-    kfree(p);
+    kfree0(p, cpuid);
 }
 
-// Free the page of physical memory pointed at by v,
-// which normally should have been returned by a
-// call to kalloc().  (The exception is when
-// initializing the allocator; see kinit above.)
 void
-kfree(void *pa)
+kfree0(void *pa, uint32 cpuid)
 {
   struct run *r;
 
@@ -56,25 +63,47 @@ kfree(void *pa)
 
   r = (struct run*)pa;
 
-  acquire(&kmem.lock);
-  r->next = kmem.freelist;
-  kmem.freelist = r;
-  release(&kmem.lock);
+  acquire(&kmem.locks[cpuid]);
+  r->next = kmem.freelists[cpuid];
+  kmem.freelists[cpuid] = r;
+  release(&kmem.locks[cpuid]);
 }
 
-// Allocate one 4096-byte page of physical memory.
-// Returns a pointer that the kernel can use.
-// Returns 0 if the memory cannot be allocated.
+void
+kfree(void *pa)
+{
+  kfree0(pa, cpuid());
+}
+
 void *
 kalloc(void)
 {
   struct run *r;
+  uint64 cid = cpuid();
 
-  acquire(&kmem.lock);
-  r = kmem.freelist;
+  acquire(&kmem.locks[cid]);
+  r = kmem.freelists[cid];
   if(r)
-    kmem.freelist = r->next;
-  release(&kmem.lock);
+    kmem.freelists[cid] = r->next;
+  else {
+    // borrow from other harts
+    acquire(&kmem.borrow_mutex);
+    for (int i = 0; i < CPUS; i++) {
+      if (i == cid) {
+        continue;
+      }
+      acquire(&kmem.locks[i]);
+      r = kmem.freelists[i];
+      if (r) {
+        kmem.freelists[i] = r->next;
+        release(&kmem.locks[i]);
+        break;
+      }
+      release(&kmem.locks[i]);
+    }
+    release(&kmem.borrow_mutex);
+  }
+  release(&kmem.locks[cid]);
 
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk
