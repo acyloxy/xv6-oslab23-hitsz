@@ -13,7 +13,7 @@ int main(void) {
         write(p1[1], "ping", 5);
         char rcv[5];
         read(p2[0], rcv, 5);
-        printf("<%d>: received %s\n", getpid(), rcv);
+        printf("%d: received %s\n", getpid(), rcv);
         int status;
         wait(&status);
     } else {
@@ -21,7 +21,7 @@ int main(void) {
         close(p2[0]);
         char rcv[5];
         read(p1[0], rcv, 5);
-        printf("<%d>: received %s\n", getpid(), rcv);
+        printf("%d: received %s\n", getpid(), rcv);
         write(p2[1], "pong", 5);
     }
     exit(0);
