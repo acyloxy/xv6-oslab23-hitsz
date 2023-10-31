@@ -87,7 +87,9 @@ kalloc(void)
     kmem.freelists[cid] = r->next;
   else {
     // borrow from other harts
+    release(&kmem.locks[cid]);
     acquire(&kmem.borrow_mutex);
+    acquire(&kmem.locks[cid]);
     for (int i = 0; i < CPUS; i++) {
       if (i == cid) {
         continue;
