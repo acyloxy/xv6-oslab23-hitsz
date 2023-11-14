@@ -21,6 +21,7 @@ struct run {
 struct {
   struct spinlock lock;
   struct run *freelist;
+  int num_free_pages;
 } kmem;
 
 void kinit() {
@@ -51,6 +52,7 @@ void kfree(void *pa) {
   acquire(&kmem.lock);
   r->next = kmem.freelist;
   kmem.freelist = r;
+  kmem.num_free_pages++;
   release(&kmem.lock);
 }
 
@@ -63,8 +65,13 @@ void *kalloc(void) {
   acquire(&kmem.lock);
   r = kmem.freelist;
   if (r) kmem.freelist = r->next;
+  if (r) kmem.num_free_pages--;
   release(&kmem.lock);
 
   if (r) memset((char *)r, 5, PGSIZE);  // fill with junk
   return (void *)r;
+}
+
+int num_free_pages() {
+  return kmem.num_free_pages;
 }

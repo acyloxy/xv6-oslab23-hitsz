@@ -31,7 +31,7 @@ int exec(char *path, char **argv) {
   if (readi(ip, 0, (uint64)&elf, 0, sizeof(elf)) != sizeof(elf)) goto bad;
   if (elf.magic != ELF_MAGIC) goto bad;
 
-  if ((pagetable = proc_pagetable(p)) == 0) goto bad;
+  if ((pagetable = proc_pagetable(p, map_va(KSTACK_FIXED))) == 0) goto bad;
 
   // Load program into memory.
   for (i = 0, off = elf.phoff; i < elf.phnum; i++, off += sizeof(ph)) {
@@ -90,12 +90,19 @@ int exec(char *path, char **argv) {
   safestrcpy(p->name, last, sizeof(p->name));
 
   // Commit to the user image.
+  w_satp(MAKE_SATP(pagetable));
+  sfence_vma();
   oldpagetable = p->pagetable;
   p->pagetable = pagetable;
   p->sz = sz;
   p->trapframe->epc = elf.entry;  // initial program counter = main
   p->trapframe->sp = sp;          // initial stack pointer
+  p->context.satp = MAKE_SATP(pagetable);
   proc_freepagetable(oldpagetable, oldsz);
+
+  if (p->pid == 1) {
+    vmprint(p->pagetable, 1);
+  }
 
   return argc;  // this ends up in a0, the first argument to main(argc, argv)
 

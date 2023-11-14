@@ -21,6 +21,8 @@ static void freeproc(struct proc *p);
 
 extern char trampoline[];  // trampoline.S
 
+extern char etext[];
+
 // initialize the proc table at boot time.
 void procinit(void) {
   struct proc *p;
@@ -29,6 +31,7 @@ void procinit(void) {
   for (p = proc; p < &proc[NPROC]; p++) {
     initlock(&p->lock, "proc");
 
+    /*
     // Allocate a page for the process's kernel stack.
     // Map it high in memory, followed by an invalid
     // guard page.
@@ -37,8 +40,9 @@ void procinit(void) {
     uint64 va = KSTACK((int)(p - proc));
     kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
     p->kstack = va;
+    */
   }
-  kvminithart();
+  //kvminithart();
 }
 
 // Must be called with interrupts disabled,
@@ -104,7 +108,7 @@ found:
   }
 
   // An empty user page table.
-  p->pagetable = proc_pagetable(p);
+  p->pagetable = proc_pagetable(p, 0);
   if (p->pagetable == 0) {
     freeproc(p);
     release(&p->lock);
@@ -115,7 +119,8 @@ found:
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
-  p->context.sp = p->kstack + PGSIZE;
+  p->context.sp = (p->kstack = KSTACK_FIXED) + PGSIZE;
+  p->context.satp = MAKE_SATP(p->pagetable);
 
   return p;
 }
@@ -124,6 +129,8 @@ found:
 // including user pages.
 // p->lock must be held.
 static void freeproc(struct proc *p) {
+  if (p->kstack) kfree((void *)pagetable_map_va(p->pagetable, p->kstack));
+  p->kstack = 0;
   if (p->trapframe) kfree((void *)p->trapframe);
   p->trapframe = 0;
   if (p->pagetable) proc_freepagetable(p->pagetable, p->sz);
@@ -138,15 +145,55 @@ static void freeproc(struct proc *p) {
   p->state = UNUSED;
 }
 
+#define PLIC_MAPPING 1
+#define UART0_MAPPING (1 << 1)
+#define VIRTIO0_MAPPING (1 << 2)
+#define RX_KERNEL_MAPPING (1 << 3)
+#define RW_KERNEL_MAPPING (1 << 4)
+#define TRAMPOLINE_MAPPING (1 << 5)
+#define TRAPFRAME_MAPPING (1 << 6)
+#define KSTACK_MAPPING (1 << 7)
+
+static void proc_pagetable_unmap(pagetable_t pagetable, uint mappings) {
+  if (mappings & PLIC_MAPPING) {
+    uint64 va = PGROUNDDOWN(PLIC), npages = (PGROUNDDOWN(PLIC + 0x400000 - 1) - va) / PGSIZE + 1;
+    uvmunmap(pagetable, va, npages, 0);
+  }
+  if (mappings & UART0_MAPPING) {
+    uvmunmap(pagetable, UART0, 1, 0);
+  }
+  if (mappings & VIRTIO0_MAPPING) {
+    uvmunmap(pagetable, VIRTIO0, 1, 0);
+  }
+  if (mappings & RX_KERNEL_MAPPING) {
+    uint64 va = PGROUNDDOWN(KERNBASE), npages = (PGROUNDDOWN((uint64) etext - 1) - va) / PGSIZE + 1;
+    uvmunmap(pagetable, va, npages, 0);
+  }
+  if (mappings & RW_KERNEL_MAPPING) {
+    uint64 va = PGROUNDDOWN((uint64) etext), npages = (PGROUNDDOWN(PHYSTOP - 1) - va) / PGSIZE + 1;
+    uvmunmap(pagetable, va, npages, 0);
+  }
+  if (mappings & TRAMPOLINE_MAPPING) {
+    uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+  }
+  if (mappings & TRAPFRAME_MAPPING) {
+    uvmunmap(pagetable, TRAPFRAME, 1, 0);
+  }
+  if (mappings & KSTACK_MAPPING) {
+    uvmunmap(pagetable, KSTACK_FIXED, 1, 0);
+  }
+}
+
 // Create a user page table for a given process,
 // with no user memory, but with trampoline pages.
-pagetable_t proc_pagetable(struct proc *p) {
+pagetable_t proc_pagetable(struct proc *p, uint64 kstack) {
   pagetable_t pagetable;
 
   // An empty page table.
   pagetable = uvmcreate();
   if (pagetable == 0) return 0;
 
+  /*
   // map the trampoline code (for system call return)
   // at the highest user virtual address.
   // only the supervisor uses it, on the way
@@ -162,16 +209,43 @@ pagetable_t proc_pagetable(struct proc *p) {
     uvmfree(pagetable, 0);
     return 0;
   }
+  */
+
+  if (mappages(pagetable, PLIC, 0x400000, PLIC, PTE_R | PTE_W) < 0) goto error;
+  if (mappages(pagetable, UART0, PGSIZE, UART0, PTE_R | PTE_W) < 0) goto error;
+  if (mappages(pagetable, VIRTIO0, PGSIZE, VIRTIO0, PTE_R | PTE_W) < 0) goto error;
+  if (mappages(pagetable, KERNBASE, (uint64) etext - KERNBASE, KERNBASE, PTE_R | PTE_X) < 0) goto error;
+  if (mappages(pagetable, (uint64) etext, PHYSTOP - (uint64) etext, (uint64) etext, PTE_R | PTE_W) < 0) goto error;
+  if (mappages(pagetable, TRAMPOLINE, PGSIZE, (uint64) trampoline, PTE_R | PTE_X) < 0) goto error;
+  if (mappages(pagetable, TRAPFRAME, PGSIZE, (uint64) p->trapframe, PTE_R | PTE_W) < 0) goto error;
+
+  int free_kstack = 0;
+  if (kstack == 0) {
+    free_kstack = 1;
+    kstack = (uint64) kalloc();
+    if (kstack == 0) {
+      goto error;
+    }
+  }
+  if (mappages(pagetable, KSTACK_FIXED, PGSIZE, kstack, PTE_R | PTE_W) < 0) {
+    if (free_kstack) {
+      kfree((void *) kstack);
+    }
+    goto error;
+  }
 
   return pagetable;
+
+  error:
+  uvmfree(pagetable, 0, 1);
+  return 0;
 }
 
 // Free a process's page table, and free the
 // physical memory it refers to.
 void proc_freepagetable(pagetable_t pagetable, uint64 sz) {
-  uvmunmap(pagetable, TRAMPOLINE, 1, 0);
-  uvmunmap(pagetable, TRAPFRAME, 1, 0);
-  uvmfree(pagetable, sz);
+  proc_pagetable_unmap(pagetable, 0xff);
+  uvmfree(pagetable, sz, 0);
 }
 
 // a user program that calls exec("/init")

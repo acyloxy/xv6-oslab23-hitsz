@@ -227,16 +227,16 @@ uint64 uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz) {
 
 // Recursively free page-table pages.
 // All leaf mappings must already have been removed.
-void freewalk(pagetable_t pagetable) {
+void freewalk(pagetable_t pagetable, int ignore_leaf) {
   // there are 2^9 = 512 PTEs in a page table.
   for (int i = 0; i < 512; i++) {
     pte_t pte = pagetable[i];
     if ((pte & PTE_V) && (pte & (PTE_R | PTE_W | PTE_X)) == 0) {
       // this PTE points to a lower-level page table.
       uint64 child = PTE2PA(pte);
-      freewalk((pagetable_t)child);
+      freewalk((pagetable_t)child, ignore_leaf);
       pagetable[i] = 0;
-    } else if (pte & PTE_V) {
+    } else if (!ignore_leaf && (pte & PTE_V)) {
       panic("freewalk: leaf");
     }
   }
@@ -245,9 +245,9 @@ void freewalk(pagetable_t pagetable) {
 
 // Free user memory pages,
 // then free page-table pages.
-void uvmfree(pagetable_t pagetable, uint64 sz) {
+void uvmfree(pagetable_t pagetable, uint64 sz, int ignore_leaf) {
   if (sz > 0) uvmunmap(pagetable, 0, PGROUNDUP(sz) / PGSIZE, 1);
-  freewalk(pagetable);
+  freewalk(pagetable, ignore_leaf);
 }
 
 // Given a parent process's page table, copy
@@ -316,6 +316,14 @@ int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len) {
 // Copy len bytes to dst from virtual address srcva in a given page table.
 // Return 0 on success, -1 on error.
 int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
+  if (r_satp() == MAKE_SATP(pagetable)) {
+    uint64 sstatus = r_sstatus();
+    w_sstatus(sstatus | SSTATUS_SUM);
+    int ret = copyin_new(pagetable, dst, srcva, len);
+    w_sstatus(sstatus);
+    return ret;
+  }
+
   uint64 n, va0, pa0;
 
   while (len > 0) {
@@ -338,6 +346,14 @@ int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
 // until a '\0', or max.
 // Return 0 on success, -1 on error.
 int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max) {
+  if (r_satp() == MAKE_SATP(pagetable)) {
+    uint64 sstatus = r_sstatus();
+    w_sstatus(sstatus | SSTATUS_SUM);
+    int ret = copyinstr_new(pagetable, dst, srcva, max);
+    w_sstatus(sstatus);
+    return ret;
+  }
+
   uint64 n, va0, pa0;
   int got_null = 0;
 
@@ -378,4 +394,67 @@ int test_pagetable() {
   uint64 gsatp = MAKE_SATP(kernel_pagetable);
   printf("test_pagetable: %d\n", satp != gsatp);
   return satp != gsatp;
+}
+
+static char *pte_prefix(int level) {
+  switch (level) {
+    case 2:
+      return "||";
+    case 1:
+      return "||   ||";
+    case 0:
+      return "||   ||   ||";
+    default:
+      return 0;
+  }
+}
+
+static void print_pte(pte_t *pte, int level, int idx, uint64 va, int user_only) {
+  char *prefix = pte_prefix(level);
+  char *r = (*pte & PTE_R) ? "r" : "-";
+  char *w = (*pte & PTE_W) ? "w" : "-";
+  char *x = (*pte & PTE_X) ? "x" : "-";
+  char *u = (*pte & PTE_U) ? "u" : "-";
+  if (level == 0) {
+    printf("%sidx: %d: va: %p -> pa: %p, flags: %s%s%s%s\n", prefix, idx, va, PTE2PA(*pte), r, w, x, u);
+  } else {
+    printf("%sidx: %d: pa: %p, flags: %s%s%s%s\n", prefix, idx, PTE2PA(*pte), r, w, x, u);
+    pagetable_t pagetable = (pagetable_t) PTE2PA(*pte);
+    for (int i = 0; i < (user_only ? (level == 2 ? 0xc << 3 : 512) : 512); i++) {
+      pte = &pagetable[i];
+      if (*pte & PTE_V) {
+        print_pte(pte, level - 1, i, va + (((uint64) i) << (12 + 9 * (level - 1))), user_only);
+      }
+    }
+  }
+}
+
+void vmprint(pagetable_t pagetable, int user_only) {
+  printf("page table %p\n", pagetable);
+  for (int i = 0; i < (user_only ? 1 : 512); i++) {
+    pte_t *pte = &pagetable[i];
+    if (*pte & PTE_V) {
+      print_pte(pte, 2, i, ((uint64) i) << 30, user_only);
+    }
+  }
+  if (user_only) {
+    for (int i = 255; i < 512; i++) {
+      pte_t *pte = &pagetable[i];
+      if (*pte & PTE_V) {
+        print_pte(pte, 2, i, ((uint64) i) << 30, 0);
+      }
+    }
+  }
+}
+
+uint64 pagetable_map_va(pagetable_t pagetable, uint64 va) {
+  pte_t *pte = walk(pagetable, va, 0);
+  if (pte == 0 || (*pte & PTE_V) == 0) {
+    return 0;
+  }
+  return PTE2PA(*pte) + va % PGSIZE;
+}
+
+uint64 map_va(uint64 va) {
+  return pagetable_map_va(SATP2PAGETABLE(r_satp()), va);
 }
